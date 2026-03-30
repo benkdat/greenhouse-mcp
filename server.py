@@ -799,4 +799,9 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+        import uvicorn
+        uvicorn.run(
+            mcp.streamable_http_app(),
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 8000)),
+        )
