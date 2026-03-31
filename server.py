@@ -791,6 +791,11 @@ async def greenhouse_stale_pipeline_report(params: ListJobsInput) -> str:
         return _handle_error(e)
 
 
+# ── ASGI App (for uvicorn / Render) ──────────────────────────────────────────
+
+app = mcp.streamable_http_app()
+
+
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -799,9 +804,4 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        import uvicorn
-        uvicorn.run(
-            mcp.streamable_http_app(),
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", 8000)),
-        )
+        mcp.run(transport="streamable-http")
