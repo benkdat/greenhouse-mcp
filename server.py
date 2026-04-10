@@ -4,14 +4,17 @@ Exposes DAT's Greenhouse Harvest API data to Claude for recruiting intelligence,
 pipeline visibility, and interview rescheduling workflows.
 """
 
-import json
 import os
-from typing import Optional, List
-from datetime import datetime
+from typing import Optional
+from datetime import datetime, timezone
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -21,7 +24,7 @@ API_KEY = os.environ.get("GREENHOUSE_API_KEY", "")
 mcp = FastMCP("greenhouse_mcp")
 
 
-# ── Shared API Client ─────────────────────────────────────────────────────────
+# ── Shared API Helpers ────────────────────────────────────────────────────────
 
 async def gh_get(path: str, params: Optional[dict] = None) -> dict | list:
     """Authenticated GET request to Greenhouse Harvest API."""
@@ -36,6 +39,32 @@ async def gh_get(path: str, params: Optional[dict] = None) -> dict | list:
         )
         response.raise_for_status()
         return response.json()
+
+
+async def gh_get_all(path: str, params: Optional[dict] = None) -> list:
+    """Fetch all pages from a paginated Greenhouse endpoint (max per_page=500)."""
+    if not API_KEY:
+        raise ValueError("GREENHOUSE_API_KEY environment variable is not set.")
+    results = []
+    page = 1
+    base_params = {**(params or {}), "per_page": 500}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while True:
+            response = await client.get(
+                f"{HARVEST_BASE_URL}{path}",
+                params={**base_params, "page": page},
+                auth=(API_KEY, ""),
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list) or not data:
+                break
+            results.extend(data)
+            if len(data) < 500:
+                break
+            page += 1
+    return results
 
 
 def _handle_error(e: Exception) -> str:
@@ -78,6 +107,17 @@ class GetJobInput(BaseModel):
 class GetCandidateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     candidate_id: int = Field(..., description="Greenhouse candidate ID (numeric)", gt=0)
+
+
+class SearchCandidatesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(
+        ...,
+        description="Search term matched against candidate name or email address.",
+        min_length=1,
+    )
+    per_page: Optional[int] = Field(default=25, ge=1, le=500)
+    page: Optional[int] = Field(default=1, ge=1)
 
 
 class GetApplicationInput(BaseModel):
@@ -137,6 +177,7 @@ class GetScheduledInterviewsInput(BaseModel):
         description="ISO 8601 datetime — only return interviews starting before this time."
     )
     per_page: Optional[int] = Field(default=50, ge=1, le=500)
+    page: Optional[int] = Field(default=1, ge=1)
 
 
 class GetScorecardsInput(BaseModel):
@@ -163,6 +204,20 @@ class ListUsersInput(BaseModel):
     per_page: Optional[int] = Field(default=50, ge=1, le=500)
 
 
+class StalePipelineInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    days: int = Field(
+        default=7,
+        description="Report applications with no activity in this many days. Default: 7.",
+        ge=1,
+        le=365,
+    )
+    job_id: Optional[int] = Field(
+        default=None,
+        description="Optionally limit the report to a single job ID."
+    )
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool(
@@ -178,9 +233,9 @@ class ListUsersInput(BaseModel):
 async def greenhouse_list_jobs(params: ListJobsInput) -> str:
     """List open (or filtered) job requisitions from Greenhouse.
 
-    Returns job title, ID, department, hiring managers, recruiter, status,
-    and number of active applications per req. Use this to get an overview
-    of the recruiting pipeline or find a specific job ID for deeper queries.
+    Returns job title, ID, department, hiring managers, recruiter, and status.
+    Use this to get an overview of the recruiting pipeline or find a specific
+    job ID for deeper queries.
 
     Args:
         params (ListJobsInput):
@@ -347,6 +402,63 @@ async def greenhouse_get_candidate(params: GetCandidateInput) -> str:
 
 
 @mcp.tool(
+    name="greenhouse_search_candidates",
+    annotations={
+        "title": "Search Candidates",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+)
+async def greenhouse_search_candidates(params: SearchCandidatesInput) -> str:
+    """Search for candidates by name or email address.
+
+    Use this when you know a candidate's name but not their Greenhouse ID.
+    Returns matching candidates with their IDs, emails, and active application
+    stages so you can drill into a specific candidate with greenhouse_get_candidate.
+
+    Args:
+        params (SearchCandidatesInput):
+            - query (str): Name or email to search for.
+            - per_page (int): Results per page. Default: 25.
+            - page (int): Page number. Default: 1.
+
+    Returns:
+        str: Markdown list of matching candidates.
+    """
+    try:
+        candidates = await gh_get(
+            "/candidates",
+            params={"query": params.query, "per_page": params.per_page, "page": params.page},
+        )
+
+        if not candidates:
+            return f"No candidates found matching '{params.query}'."
+
+        lines = [f"## Candidates matching '{params.query}'\n"]
+        for c in candidates:
+            name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "Unknown"
+            emails = [e["value"] for e in c.get("email_addresses", [])]
+            apps = c.get("applications", [])
+            active = [a for a in apps if a.get("status") == "active"]
+            app_summary = ", ".join(
+                f"{a.get('jobs', [{}])[0].get('name', 'Unknown')} ({a.get('current_stage', {}).get('name', 'N/A')})"
+                for a in active
+            ) or "No active applications"
+            lines.append(
+                f"- **{name}** (ID: {c['id']}) | Email: {', '.join(emails) or 'N/A'} | "
+                f"Active: {app_summary}"
+            )
+
+        lines.append(f"\n_Page {params.page} | {len(candidates)} results_")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(
     name="greenhouse_list_applications",
     annotations={
         "title": "List Applications",
@@ -473,12 +585,13 @@ async def greenhouse_get_scheduled_interviews(params: GetScheduledInterviewsInpu
             - start_after (Optional[str]): ISO 8601 start bound.
             - start_before (Optional[str]): ISO 8601 end bound.
             - per_page (int): Results per page. Default: 50.
+            - page (int): Page number. Default: 1.
 
     Returns:
         str: Markdown list of interviews with interviewers and their emails.
     """
     try:
-        query: dict = {"per_page": params.per_page}
+        query: dict = {"per_page": params.per_page, "page": params.page}
         if params.application_id:
             query["application_id"] = params.application_id
         if params.start_after:
@@ -509,6 +622,7 @@ async def greenhouse_get_scheduled_interviews(params: GetScheduledInterviewsInpu
                 + "\n"
             )
 
+        lines.append(f"\n_Page {params.page} | {len(interviews)} interviews returned_")
         return "\n".join(lines)
 
     except Exception as e:
@@ -646,17 +760,14 @@ async def greenhouse_pipeline_summary(params: PipelineSummaryInput) -> str:
         str: Markdown pipeline summary grouped by stage.
     """
     try:
-        # Fetch job to get stage names
         job = await gh_get(f"/jobs/{params.job_id}")
         job_name = job.get("name", f"Job {params.job_id}")
 
-        # Fetch active applications
-        apps = await gh_get("/applications", params={"job_id": params.job_id, "status": "active", "per_page": 500})
+        apps = await gh_get_all("/applications", params={"job_id": params.job_id, "status": "active"})
 
         if not apps:
             return f"No active applications found for {job_name}."
 
-        # Group by stage
         stages: dict[str, list[str]] = {}
         for app in apps:
             stage = app.get("current_stage", {}).get("name", "Unknown Stage")
@@ -735,50 +846,59 @@ async def greenhouse_list_users(params: ListUsersInput) -> str:
         "openWorldHint": False,
     }
 )
-async def greenhouse_stale_pipeline_report(params: ListJobsInput) -> str:
+async def greenhouse_stale_pipeline_report(params: StalePipelineInput) -> str:
     """Find active applications with no activity in the last N days.
 
     Surfaces candidates who may be stuck or forgotten in the pipeline —
-    useful for weekly recruiter pipeline reviews.
+    useful for weekly recruiter pipeline reviews. Scans all active
+    applications (not just the first page).
 
     Args:
-        params (ListJobsInput):
-            - per_page (int): Max applications to scan. Default: 50.
-            - page (int): Page number.
+        params (StalePipelineInput):
+            - days (int): Inactivity threshold in days. Default: 7.
+            - job_id (Optional[int]): Limit report to a specific job.
 
     Returns:
-        str: Markdown report of stale applications sorted by last activity date.
+        str: Markdown report of stale applications sorted by longest inactive first.
     """
     try:
-        apps = await gh_get("/applications", params={
-            "status": "active",
-            "per_page": params.per_page,
-            "page": params.page
-        })
+        query: dict = {"status": "active"}
+        if params.job_id:
+            query["job_id"] = params.job_id
+
+        apps = await gh_get_all("/applications", params=query)
 
         if not apps:
             return "No active applications found."
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stale = []
         for app in apps:
             last_activity = app.get("last_activity_at")
-            if last_activity:
-                last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00")).replace(tzinfo=None)
+            if not last_activity:
+                continue
+            try:
+                last_dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
                 days_stale = (now - last_dt).days
-                if days_stale >= 7:
-                    candidate = app.get("candidate", {})
-                    name = f"{candidate.get('first_name', '')} {candidate.get('last_name', '')}".strip()
-                    job_name = app.get("jobs", [{}])[0].get("name", "Unknown Role")
-                    stage = app.get("current_stage", {}).get("name", "N/A")
-                    recruiter = app.get("recruiter", {}).get("name", "N/A")
-                    stale.append((days_stale, name, job_name, stage, recruiter, app["id"]))
+            except ValueError:
+                continue
+            if days_stale >= params.days:
+                candidate = app.get("candidate", {})
+                name = f"{candidate.get('first_name', '')} {candidate.get('last_name', '')}".strip()
+                job_name = app.get("jobs", [{}])[0].get("name", "Unknown Role")
+                stage = app.get("current_stage", {}).get("name", "N/A")
+                recruiter = app.get("recruiter", {}).get("name", "N/A")
+                stale.append((days_stale, name, job_name, stage, recruiter, app["id"]))
 
         if not stale:
-            return "No stale applications found (all have had activity in the last 7 days)."
+            return f"No stale applications found (all have had activity in the last {params.days} days)."
 
-        stale.sort(reverse=True)
-        lines = [f"## Stale Pipeline Report\n_{len(stale)} applications with no activity in 7+ days_\n"]
+        stale.sort(key=lambda x: x[0], reverse=True)
+        lines = [
+            f"## Stale Pipeline Report\n"
+            f"_{len(stale)} application(s) with no activity in {params.days}+ days "
+            f"(scanned {len(apps)} active total)_\n"
+        ]
         for days, name, job, stage, recruiter, app_id in stale:
             lines.append(
                 f"- **{name}** | {job} | Stage: {stage} | Recruiter: {recruiter} | "
@@ -793,7 +913,15 @@ async def greenhouse_stale_pipeline_report(params: ListJobsInput) -> str:
 
 # ── ASGI App (for uvicorn / Render) ──────────────────────────────────────────
 
-app = mcp.streamable_http_app()
+async def _health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+_mcp_asgi = mcp.streamable_http_app()
+
+app = Starlette(routes=[
+    Route("/health", _health),
+    Mount("/", _mcp_asgi),
+])
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
